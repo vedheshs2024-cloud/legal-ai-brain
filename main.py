@@ -1,7 +1,6 @@
 import os
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from typing import Optional
 import pickle
 import google.generativeai as genai
@@ -31,7 +30,7 @@ if not GOOGLE_API_KEY:
 
 genai.configure(api_key=GOOGLE_API_KEY, transport='rest')
 
-# ✅ MODEL: Using the latest Flash model
+# ✅ MODEL: Keeping your requested model name
 EMBEDDING_MODEL = "models/text-embedding-004"
 MODEL_NAME = "gemini-2.5-flash" 
 
@@ -40,7 +39,7 @@ loaded_sections = []
 try:
     with open("legal_brain.pkl", "rb") as f:
         loaded_sections = pickle.load(f)
-    print("✅ Brain Loaded Successfully! (RAG Enabled)")
+    print(f"✅ Brain Loaded Successfully! ({len(loaded_sections)} sections available)")
 except FileNotFoundError:
     print("⚠️ Brain file not found! Switching to 'General Knowledge Only' mode.")
 
@@ -50,13 +49,17 @@ def search_engine(query_text):
         return [] 
         
     try:
+        # 1. Get Query Embedding
         vec = genai.embed_content(model=EMBEDDING_MODEL, content=query_text)['embedding']
+        
+        # 2. Vectorized Search (Faster & Cleaner)
         results = []
         for s in loaded_sections:
             if 'embedding' in s:
                 score = np.dot(vec, s['embedding'])
                 if score > 0.45: # Threshold
                     results.append((score, s))
+        
         return sorted(results, key=lambda x: x[0], reverse=True)[:5]
     except Exception as e:
         print(f"Search Error: {e}")
@@ -76,7 +79,7 @@ def get_legal_advice(story, laws):
     else:
         law_txt = "No specific match in local criminal database. USE GENERAL INDIAN LEGAL KNOWLEDGE (Civil, Family, Corporate, Constitutional, etc.)."
 
-    # 🌟 THE ULTIMATE PROMPT (Universal + Memory + Multilingual)
+    # 🌟 THE ULTIMATE PROMPT (Restored your specific instructions + JSON Mode)
     prompt = f"""
     You are an Expert Indian Legal Consultant covering ALL domains:
     1. Criminal Law (BNS, BNSS, BSA)
@@ -95,13 +98,16 @@ def get_legal_advice(story, laws):
     
     1. **LANGUAGE (CRITICAL):** Detect the language of the 'USER SITUATION'. You MUST reply in the **SAME LANGUAGE** (Hindi, Tamil, English, Hinglish, etc.).
     
-    2. **MEMORY & CONTEXT:** Analyze the LATEST user question in the context of the history provided above. If the user asks a follow-up (e.g., "What is the punishment?"), refer to the previous topic.
+    2. **MEMORY & CONTEXT:** Analyze the LATEST user question in the context of the history provided above. If the user asks a follow-up, refer to the previous topic.
     
-    3. **UNIVERSAL KNOWLEDGE:** If the user's query is about Civil/Family/Corporate law and no database match is found, DO NOT fail. Use your general knowledge of Indian Law to answer accurately.
+    3. **UNIVERSAL KNOWLEDGE:** If the user's query is about Civil/Family/Corporate law and no database match is found, DO NOT fail. Use your general knowledge.
 
-    PART 1: PUBLIC RESPONSE (Simple & Clean)
+    OUTPUT FORMAT:
+    You must return a SINGLE valid JSON object with keys "public" and "student". 
+    Do not use markdown code blocks (like ```json). Just the raw JSON.
+
+    KEY 1: "public" (Simple & Clean)
     - Audience: Normal citizens.
-    - 🛑 NO technical jargon or accuracy scores here.
     - Structure (Translate headers to user's language):
       ### 🛑 **DIRECT ANSWER**
       (Clear answer in user's language)
@@ -112,39 +118,25 @@ def get_legal_advice(story, laws):
       ### 🚀 **NEXT STEPS**
       (3 clear steps in user's language)
 
-    PART 2: SEPARATOR
-    - Write exactly "|||"
-
-    PART 3: STUDENT RESPONSE (Deep Dive)
+    KEY 2: "student" (Deep Dive)
     - Audience: Lawyers & Students.
-    - ✅ INCLUDE Accuracy Scores if you are confident: `Accuracy: 90%`.
-    - Cite Case Laws (AIR, SCC) if applicable.
     - Structure:
       ### 🎓 **LEGAL DEEP DIVE**
-      
-      **Analysis:**
-      (Apply the specific Act—e.g., Section 13B of HMA for Divorce, or Section 303 BNS for Theft).
-      
-      **Precedent / Doctrine:**
-      (Cite relevant legal principles).
+      **Analysis:** (Apply specific Acts).
+      **Precedent / Doctrine:** (Cite case laws/principles).
+      **Accuracy:** (Include 'Accuracy: 90%' score).
     --------------------------------------------------------
     """
     
     model = genai.GenerativeModel(MODEL_NAME)
-    response = model.generate_content(prompt).text.strip()
     
-    if "|||" in response:
-        parts = response.split("|||")
-        public_part = parts[0].strip()
-        student_part = parts[1].strip()
-    else:
-        public_part = response
-        student_part = "### 🎓 **No Additional Technical Detail**\n(Refer to the public answer)."
-
-    return json.dumps({
-        "public": public_part,
-        "student": student_part
-    })
+    # ✅ FORCE JSON MODE (Fixes the splitting issues while keeping your prompt)
+    response = model.generate_content(
+        prompt,
+        generation_config={"response_mime_type": "application/json"}
+    )
+    
+    return response.text
 
 @app.post("/ask_lawyer")
 async def ask_lawyer(
@@ -163,7 +155,7 @@ async def ask_lawyer(
             print(f"   Image Analysis: {image_desc}")
             full_context = f"User says: {story}. \nPhoto shows: {image_desc}"
 
-        # Search (Hybrid Strategy)
+        # Search
         print("🔍 Searching Database...")
         matches = search_engine(full_context)
         
@@ -174,13 +166,24 @@ async def ask_lawyer(
 
         # Advice
         print("⚖️ Drafting Advice...")
-        advice = get_legal_advice(full_context, relevant_laws)
+        advice_json_string = get_legal_advice(full_context, relevant_laws)
         
-        return {"analysis": advice}
+        # ✅ VERIFY JSON (Prevents frontend crashes)
+        try:
+            parsed_advice = json.loads(advice_json_string)
+        except json.JSONDecodeError:
+            # Fallback if AI makes a tiny syntax error
+            parsed_advice = {
+                "public": advice_json_string, 
+                "student": "### 🎓 Error\nCould not format deep dive."
+            }
+        
+        # Return Object (Not String)
+        return {"analysis": parsed_advice}
 
     except Exception as e:
         print("❌ CRITICAL ERROR:")
         traceback.print_exc()
-        # 👇 NEW: Send the actual error to the phone screen!
         error_message = f"### ⚠️ System Error\nI encountered a technical issue:\n\n`{str(e)}`"
-        return {"analysis": json.dumps({"public": error_message, "student": "Check server logs for traceback."})}
+        # Return valid JSON structure even on error
+        return {"analysis": {"public": error_message, "student": "Check server logs for traceback."}}
