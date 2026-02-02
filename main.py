@@ -9,6 +9,7 @@ from PIL import Image
 import io
 import traceback
 import json 
+import uvicorn # 👈 Needed for Render deployment
 
 app = FastAPI()
 
@@ -22,44 +23,39 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------
-# ⚠️ YOUR API KEY
+# ⚠️ API KEY SETUP
 # ---------------------------------------------------------
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 if not GOOGLE_API_KEY:
-    print("❌ Error: Google API Key not found in Environment Variables!")
+    print("❌ Error: Google API Key not found!")
 
 genai.configure(api_key=GOOGLE_API_KEY, transport='rest')
 
-# ✅ MODEL: Keeping your requested model name
+# ✅ MODEL CONFIG (Smart Fallback)
 EMBEDDING_MODEL = "models/text-embedding-004"
-MODEL_NAME = "gemini-2.5-flash" 
+REQUESTED_MODEL = "gemini-2.5-flash" 
+FALLBACK_MODEL = "gemini-1.5-flash"
 
 # Load Brain (Criminal Law Database)
 loaded_sections = []
 try:
     with open("legal_brain.pkl", "rb") as f:
         loaded_sections = pickle.load(f)
-    print(f"✅ Brain Loaded Successfully! ({len(loaded_sections)} sections available)")
+    print(f"✅ Brain Loaded: {len(loaded_sections)} sections available.")
 except FileNotFoundError:
-    print("⚠️ Brain file not found! Switching to 'General Knowledge Only' mode.")
+    print("⚠️ Brain file not found! Mode: General Knowledge.")
 
 # Helper Functions
 def search_engine(query_text):
-    if not loaded_sections:
-        return [] 
-        
+    if not loaded_sections: return []
     try:
-        # 1. Get Query Embedding
         vec = genai.embed_content(model=EMBEDDING_MODEL, content=query_text)['embedding']
-        
-        # 2. Vectorized Search (Faster & Cleaner)
         results = []
         for s in loaded_sections:
             if 'embedding' in s:
                 score = np.dot(vec, s['embedding'])
-                if score > 0.45: # Threshold
+                if score > 0.45:
                     results.append((score, s))
-        
         return sorted(results, key=lambda x: x[0], reverse=True)[:5]
     except Exception as e:
         print(f"Search Error: {e}")
@@ -67,19 +63,24 @@ def search_engine(query_text):
 
 def analyze_image(image_bytes):
     image = Image.open(io.BytesIO(image_bytes))
-    model = genai.GenerativeModel(MODEL_NAME) 
-    prompt = "Describe this image in detail for a legal context (e.g., accident, contract, injury, property dispute)."
-    response = model.generate_content([prompt, image])
-    return response.text
+    # Try 2.5, fallback to 1.5 if it fails
+    try:
+        model = genai.GenerativeModel(REQUESTED_MODEL)
+        response = model.generate_content(["Describe this image in detail for a legal context (accident, contract, injury).", image])
+        return response.text
+    except:
+        model = genai.GenerativeModel(FALLBACK_MODEL)
+        response = model.generate_content(["Describe this image in detail for a legal context.", image])
+        return response.text
 
 def get_legal_advice(story, laws):
-    # Logic: Use Database matches if found, otherwise fallback to General Knowledge.
     if laws:
         law_txt = "\n".join([f"DATABASE MATCH - SEC {l['section_id']}: {l['text']}" for l in laws])
     else:
-        law_txt = "No specific match in local criminal database. USE GENERAL INDIAN LEGAL KNOWLEDGE (Civil, Family, Corporate, Constitutional, etc.)."
+        law_txt = "No specific match in local criminal database. USE GENERAL INDIAN LEGAL KNOWLEDGE."
 
-    # 🌟 THE ULTIMATE PROMPT (Restored your specific instructions + JSON Mode)
+    # 🌟 ULTIMATE HYBRID PROMPT
+    # Contains ALL your old instructions, but formatted for JSON safety.
     prompt = f"""
     You are an Expert Indian Legal Consultant covering ALL domains:
     1. Criminal Law (BNS, BNSS, BSA)
@@ -98,17 +99,17 @@ def get_legal_advice(story, laws):
     
     1. **LANGUAGE (CRITICAL):** Detect the language of the 'USER SITUATION'. You MUST reply in the **SAME LANGUAGE** (Hindi, Tamil, English, Hinglish, etc.).
     
-    2. **MEMORY & CONTEXT:** Analyze the LATEST user question in the context of the history provided above. If the user asks a follow-up, refer to the previous topic.
+    2. **MEMORY & CONTEXT:** Analyze the LATEST user question in the context of the history.
     
-    3. **UNIVERSAL KNOWLEDGE:** If the user's query is about Civil/Family/Corporate law and no database match is found, DO NOT fail. Use your general knowledge.
+    3. **UNIVERSAL KNOWLEDGE:** If no database match is found, use general Indian Law knowledge. Do not fail.
 
+    --------------------------------------------------------
     OUTPUT FORMAT:
-    You must return a SINGLE valid JSON object with keys "public" and "student". 
-    Do not use markdown code blocks (like ```json). Just the raw JSON.
-
-    KEY 1: "public" (Simple & Clean)
-    - Audience: Normal citizens.
-    - Structure (Translate headers to user's language):
+    Return a SINGLE VALID JSON OBJECT with keys "public" and "student".
+    
+    KEY 1: "public"
+    (Content for Normal Citizens. Simple & Clean. NO Jargon.)
+    * Structure the text using Markdown:
       ### 🛑 **DIRECT ANSWER**
       (Clear answer in user's language)
       
@@ -118,72 +119,66 @@ def get_legal_advice(story, laws):
       ### 🚀 **NEXT STEPS**
       (3 clear steps in user's language)
 
-    KEY 2: "student" (Deep Dive)
-    - Audience: Lawyers & Students.
-    - Structure:
+    KEY 2: "student"
+    (Content for Lawyers & Students. Deep Dive.)
+    * Structure the text using Markdown:
       ### 🎓 **LEGAL DEEP DIVE**
-      **Analysis:** (Apply specific Acts).
-      **Precedent / Doctrine:** (Cite case laws/principles).
-      **Accuracy:** (Include 'Accuracy: 90%' score).
-    --------------------------------------------------------
+      
+      **Analysis:**
+      (Apply specific Acts - e.g. BNS, HMA).
+      
+      **Precedent / Doctrine:**
+      (Cite relevant legal principles/case laws).
+      
+      **Accuracy:** (Include 'Accuracy: 90%' score based on your confidence).
     """
     
-    model = genai.GenerativeModel(MODEL_NAME)
-    
-    # ✅ FORCE JSON MODE (Fixes the splitting issues while keeping your prompt)
-    response = model.generate_content(
-        prompt,
-        generation_config={"response_mime_type": "application/json"}
-    )
+    # 🛡️ SMART MODEL SWITCHING & JSON ENFORCEMENT
+    try:
+        model = genai.GenerativeModel(REQUESTED_MODEL)
+        response = model.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
+    except Exception as e:
+        print(f"⚠️ Model {REQUESTED_MODEL} failed, switching to {FALLBACK_MODEL}")
+        model = genai.GenerativeModel(FALLBACK_MODEL)
+        response = model.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
     
     return response.text
 
 @app.post("/ask_lawyer")
-async def ask_lawyer(
-    story: str = Form(...), 
-    file: Optional[UploadFile] = File(None)
-):
+async def ask_lawyer(story: str = Form(...), file: Optional[UploadFile] = File(None)):
     try:
         print(f"📝 Received Story: {story}")
         full_context = story
         
-        # Image Handling
         if file:
             print("📸 Processing Image...")
             contents = await file.read()
             image_desc = analyze_image(contents)
-            print(f"   Image Analysis: {image_desc}")
-            full_context = f"User says: {story}. \nPhoto shows: {image_desc}"
+            full_context = f"User Story: {story}. \nImage Analysis: {image_desc}"
 
         # Search
         print("🔍 Searching Database...")
         matches = search_engine(full_context)
-        
         relevant_laws = [m[1] for m in matches] if matches else []
         
-        if not relevant_laws:
-            print("⚠️ No database match found. Switching to General Knowledge Mode.")
-
         # Advice
         print("⚖️ Drafting Advice...")
-        advice_json_string = get_legal_advice(full_context, relevant_laws)
+        advice_json = get_legal_advice(full_context, relevant_laws)
         
-        # ✅ VERIFY JSON (Prevents frontend crashes)
+        # Verify JSON validity
         try:
-            parsed_advice = json.loads(advice_json_string)
-        except json.JSONDecodeError:
-            # Fallback if AI makes a tiny syntax error
-            parsed_advice = {
-                "public": advice_json_string, 
-                "student": "### 🎓 Error\nCould not format deep dive."
-            }
-        
-        # Return Object (Not String)
-        return {"analysis": parsed_advice}
+            parsed = json.loads(advice_json)
+        except:
+            # Fallback if AI messes up JSON format
+            parsed = {"public": advice_json, "student": "Formatting Error"}
+
+        return {"analysis": parsed}
 
     except Exception as e:
-        print("❌ CRITICAL ERROR:")
         traceback.print_exc()
-        error_message = f"### ⚠️ System Error\nI encountered a technical issue:\n\n`{str(e)}`"
-        # Return valid JSON structure even on error
-        return {"analysis": {"public": error_message, "student": "Check server logs for traceback."}}
+        error_msg = f"### ⚠️ System Error\nI encountered a technical issue:\n\n`{str(e)}`"
+        return {"analysis": {"public": error_msg, "student": "Check Logs"}}
+
+# 🛑 CRITICAL FIX FOR RENDER DEPLOYMENT
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=10000)
